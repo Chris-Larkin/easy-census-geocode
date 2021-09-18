@@ -73,9 +73,106 @@ print('Chunk size:', chunk_size)
 print('Number of chunks:', n_chunks)
 
 
+def addressbatch_retry(i, data, sleep=30, att=3):
+    '''
+    call cg.addressbatch() and retry 'att' times if it fails
+    '''
+    cg = censusgeocode.CensusGeocode()
+    time.sleep(random.randint(1,40) / 10)
+    data = data.read()
+    while att > 0:
+        try:
+            att -= 1
+            r = cg.addressbatch(io.StringIO(data), timeout=8*60)
+            return r
+        except Exception as ex:
+            safe_print('ERROR:', ex)
+            if att > 0:
+                safe_print(f'Waiting {sleep} secs before trying again. Remaing {att} attempts.')
+                time.sleep(sleep)
+                sleep *= 2
+    return None
 
 
 
+def geocode(i):
+    cdf = df[i*chunk_size:(i+1)*chunk_size]
+    
+    safe_print(f'geocoding chunk {i+1}/{n_chunks}')
+    
+    istart = time.perf_counter()
+    k = addressbatch_retry(i, io.StringIO(cdf.to_csv(header=False)))
+    iend = start_time = time.perf_counter()
+    
+    if k:
+        safe_print(f'chunk {i+1} OK. Partial: {iend-istart:.2f} secs. Total: {(iend-start)/60:.2f} mins')
+        
+        # include results in the cache
+        with cache_lock:
+            r_df = pd.DataFrame(k)
+            r_df = r_df.set_index('id')
+            m = df[k_columns].merge(r_df, on='id')
+            cache.update(m.drop_duplicates(k_columns).set_index(k_columns).to_dict('index'))
+            cachefile.write_bytes(pickle.dumps(cache))
+        return k
+    else:
+        safe_print(f'chunk {i+1} FAILED. Partial: {iend-istart:.2f} secs. Total: {(iend-start)/60:.2f} mins')
+        return None
+    
+    
+    
+results = []
+start = time.perf_counter()
+with ThreadPoolExecutor(max_workers=16) as executor:
+    results = executor.map(geocode, range(n_chunks))
+    
+    
+    
+results = list(results)
 
+# dataframe with results
+results_df = pd.concat(map(lambda r: pd.DataFrame(r).set_index('id'), filter(lambda e: e is not None, results)))
 
+# update dataframe with results
+df.update(results_df)
+
+fdf = df_with_cache.copy()
+fdf.update(df)
+
+# select rows that were not geocoded
+errors_df = fdf[fdf['match'].isnull()]
+
+print(f'geocoding {errors_df.shape[0]} failed addresses')
+
+errors_n_chuncks = math.ceil(errors_df.shape[0] / 50)
+results = []
+for i in range(errors_n_chuncks):
+    data = errors_df.iloc[i*50:(i+1)*50][['num_street','city','state','zip_code']].to_csv(header=False)
+    k = addressbatch_retry(i, io.StringIO(data))
+    
+    if k:
+        print(f'{i+1}/{errors_n_chuncks} OK')
+        results.append(k)
+        
+        print('len cache:', len(cache))
+        r_df = pd.DataFrame(k)
+        r_df = r_df.set_index('id')
+        m = df[k_columns].merge(r_df, on='id')
+        cache.update(m.drop_duplicates(k_columns).set_index(k_columns).to_dict('index'))
+        cachefile.write_bytes(pickle.dumps(cache))
+        print('len cache:', len(cache))
+    else:
+        print(f'{i+1}/{errors_n_chuncks} FAILED')
+        
+        
+ 
+# update dataframe
+if results:
+    errors_results_df = pd.concat(map(lambda r: pd.DataFrame(r).set_index('id'), results))
+    fdf.update(errors_results_df)
+    
+    
+    
+# save results
+fdf.to_csv('final.csv')
 
